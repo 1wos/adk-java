@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.1](https://github.com/google/adk-java/compare/v1.3.0...v1.3.1) (2026-05-19)
+
+
+### Bug Fixes
+
+* Suppress empty-text-only chunks from streaming responses while preserving carried metadata ([b4791ef](https://github.com/google/adk-java/commit/b4791ef362840e79d008221f272992532c4732cd))
+
 ## [1.3.0](https://github.com/google/adk-java/compare/v1.2.0...v1.3.0) (2026-05-13)
 
 
