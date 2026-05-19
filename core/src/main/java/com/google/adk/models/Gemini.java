@@ -23,7 +23,6 @@ import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.genai.Client;
 import com.google.genai.ResponseStream;
-import com.google.genai.types.Candidate;
 import com.google.genai.types.Content;
 import com.google.genai.types.FinishReason;
 import com.google.genai.types.GenerateContentConfig;
@@ -239,114 +238,134 @@ public class Gemini extends BaseLlm {
   }
 
   static Flowable<LlmResponse> processRawResponses(Flowable<GenerateContentResponse> rawResponses) {
-    final StringBuilder accumulatedText = new StringBuilder();
-    final StringBuilder accumulatedThoughtText = new StringBuilder();
-    // Array to bypass final local variable reassignment in lambda.
-    final GenerateContentResponse[] lastRawResponseHolder = {null};
-    return rawResponses
-        .concatMap(
-            rawResponse -> {
-              lastRawResponseHolder[0] = rawResponse;
-              logger.trace("Raw streaming response: {}", rawResponse);
+    return Flowable.defer(() -> new StreamingResponseAggregator().process(rawResponses));
+  }
 
-              List<LlmResponse> responsesToEmit = new ArrayList<>();
-              LlmResponse currentProcessedLlmResponse = LlmResponse.create(rawResponse);
-              Optional<Part> part = GeminiUtil.getPart0FromLlmResponse(currentProcessedLlmResponse);
-              String currentTextChunk = part.flatMap(Part::text).orElse("");
+  private static final class StreamingResponseAggregator {
+    private final StringBuilder accumulatedText = new StringBuilder();
+    private final StringBuilder accumulatedThoughtText = new StringBuilder();
+    private final List<Part> accumulatedFunctionCalls = new ArrayList<>();
+    private GenerateContentResponse lastRawResponse = null;
 
-              if (!currentTextChunk.isBlank()) {
-                if (part.get().thought().orElse(false)) {
-                  accumulatedThoughtText.append(currentTextChunk);
-                  responsesToEmit.add(
-                      thinkingResponseFromText(currentTextChunk).toBuilder()
-                          .usageMetadata(currentProcessedLlmResponse.usageMetadata().orElse(null))
-                          .partial(true)
-                          .build());
-                } else {
-                  accumulatedText.append(currentTextChunk);
-                  responsesToEmit.add(
-                      responseFromText(currentTextChunk).toBuilder()
-                          .usageMetadata(currentProcessedLlmResponse.usageMetadata().orElse(null))
-                          .partial(true)
-                          .build());
-                }
-              } else {
-                if (accumulatedThoughtText.length() > 0
-                    && GeminiUtil.shouldEmitAccumulatedText(currentProcessedLlmResponse)) {
-                  LlmResponse aggregatedThoughtResponse =
-                      thinkingResponseFromText(accumulatedThoughtText.toString());
-                  responsesToEmit.add(aggregatedThoughtResponse);
-                  accumulatedThoughtText.setLength(0);
-                }
-                if (accumulatedText.length() > 0
-                    && GeminiUtil.shouldEmitAccumulatedText(currentProcessedLlmResponse)) {
-                  LlmResponse aggregatedTextResponse = responseFromText(accumulatedText.toString());
-                  responsesToEmit.add(aggregatedTextResponse);
-                  accumulatedText.setLength(0);
-                }
-                if (isEmptyTextOnlyResponse(currentProcessedLlmResponse)) {
-                  // Strip the empty-text content while preserving any carried metadata
-                  // (`usageMetadata`, `finishReason`, `modelVersion`, etc.) by emitting a
-                  // content-less response marked as `partial`. This handles the trailing
-                  // `{parts:[{text:""}], finishReason:STOP}` chunk emitted by some Gemini
-                  // preview models (e.g. 3.1-flash-lite) after a function call: keeping
-                  // the chunk as-is would propagate it as a non-partial event whose
-                  // Event#finalResponse() returns true and prematurely terminate
-                  // BaseLlmFlow#run before the function response is sent back to the
-                  // model; dropping it entirely would lose the carried metadata. If the
-                  // chunk carries no useful metadata at all, suppress it outright.
-                  LlmResponse metadataOnly =
-                      currentProcessedLlmResponse.toBuilder()
-                          .content((Content) null)
-                          .partial(true)
-                          .build();
-                  if (hasUsefulMetadata(metadataOnly)) {
-                    responsesToEmit.add(metadataOnly);
-                  }
-                } else {
-                  responsesToEmit.add(currentProcessedLlmResponse);
-                }
-              }
-              logger.debug("Responses to emit: {}", responsesToEmit);
-              return Flowable.fromIterable(responsesToEmit);
-            })
-        .concatWith(
-            Flowable.defer(
-                () -> {
-                  GenerateContentResponse finalRawResp = lastRawResponseHolder[0];
-                  if (finalRawResp == null) {
-                    return Flowable.empty();
-                  }
-                  boolean isStop =
-                      finalRawResp
-                          .candidates()
-                          .flatMap(candidates -> candidates.stream().findFirst())
-                          .flatMap(Candidate::finishReason)
-                          .map(finishReason -> finishReason.knownEnum() == FinishReason.Known.STOP)
-                          .orElse(false);
+    private Flowable<LlmResponse> process(Flowable<GenerateContentResponse> rawResponses) {
+      return rawResponses
+          .concatMap(this::processRawResponse)
+          .concatWith(Flowable.defer(this::processFinalResponse));
+    }
 
-                  if (isStop) {
-                    List<LlmResponse> finalResponses = new ArrayList<>();
-                    if (accumulatedThoughtText.length() > 0) {
-                      finalResponses.add(
-                          thinkingResponseFromText(accumulatedThoughtText.toString()).toBuilder()
-                              .usageMetadata(
-                                  accumulatedText.length() > 0
-                                      ? null
-                                      : finalRawResp.usageMetadata().orElse(null))
-                              .build());
-                    }
-                    if (accumulatedText.length() > 0) {
-                      finalResponses.add(
-                          responseFromText(accumulatedText.toString()).toBuilder()
-                              .usageMetadata(finalRawResp.usageMetadata().orElse(null))
-                              .build());
-                    }
+    private Flowable<LlmResponse> processRawResponse(GenerateContentResponse rawResponse) {
+      lastRawResponse = rawResponse;
+      logger.trace("Raw streaming response: {}", rawResponse);
 
-                    return Flowable.fromIterable(finalResponses);
-                  }
-                  return Flowable.empty();
-                }));
+      List<LlmResponse> responsesToEmit = new ArrayList<>();
+      LlmResponse currentProcessedLlmResponse = LlmResponse.create(rawResponse);
+      Optional<Part> partOpt = GeminiUtil.getPart0FromLlmResponse(currentProcessedLlmResponse);
+      String currentTextChunk = partOpt.flatMap(Part::text).orElse("");
+
+      if (!currentTextChunk.isBlank()) {
+        if (partOpt.get().thought().orElse(false)) {
+          accumulatedThoughtText.append(currentTextChunk);
+        } else {
+          accumulatedText.append(currentTextChunk);
+        }
+        responsesToEmit.add(currentProcessedLlmResponse.toBuilder().partial(true).build());
+      } else {
+        boolean emittedAggregated = false;
+        if (accumulatedThoughtText.length() > 0
+            && GeminiUtil.shouldEmitAccumulatedText(currentProcessedLlmResponse)) {
+          responsesToEmit.add(thinkingResponseFromText(accumulatedThoughtText.toString()));
+          accumulatedThoughtText.setLength(0);
+          emittedAggregated = true;
+        }
+        if (accumulatedText.length() > 0
+            && GeminiUtil.shouldEmitAccumulatedText(currentProcessedLlmResponse)) {
+          responsesToEmit.add(responseFromText(accumulatedText.toString()));
+          accumulatedText.setLength(0);
+          emittedAggregated = true;
+        }
+
+        if (partOpt.isPresent() && partOpt.get().functionCall().isPresent()) {
+          accumulatedFunctionCalls.add(partOpt.get());
+          responsesToEmit.add(currentProcessedLlmResponse.toBuilder().partial(true).build());
+        } else if (emittedAggregated && !responsesToEmit.isEmpty()) {
+          LlmResponse lastResponse = responsesToEmit.get(responsesToEmit.size() - 1);
+          responsesToEmit.set(
+              responsesToEmit.size() - 1,
+              mergeMetadata(lastResponse, currentProcessedLlmResponse, partOpt.orElse(null)));
+        } else if (!accumulatedFunctionCalls.isEmpty()) {
+          // Suppress the empty STOP chunk because processFinalResponse() will immediately emit
+          // the final aggregated function call response carrying the final metadata.
+        } else {
+          responsesToEmit.add(currentProcessedLlmResponse);
+        }
+      }
+      logger.info("Responses to emit: {}", responsesToEmit);
+      return Flowable.fromIterable(responsesToEmit);
+    }
+
+    private Flowable<LlmResponse> processFinalResponse() {
+      if (lastRawResponse == null) {
+        return Flowable.empty();
+      }
+      LlmResponse currentResponse = LlmResponse.create(lastRawResponse);
+      boolean isStop =
+          currentResponse
+              .finishReason()
+              .map(reason -> reason.knownEnum() == FinishReason.Known.STOP)
+              .orElse(false);
+
+      if (!isStop) {
+        return Flowable.empty();
+      }
+
+      List<LlmResponse> finalResponses = new ArrayList<>();
+      if (accumulatedThoughtText.length() > 0) {
+        finalResponses.add(thinkingResponseFromText(accumulatedThoughtText.toString()));
+      }
+      if (accumulatedText.length() > 0) {
+        finalResponses.add(responseFromText(accumulatedText.toString()));
+      }
+      if (!accumulatedFunctionCalls.isEmpty()) {
+        finalResponses.add(
+            LlmResponse.builder()
+                .content(Content.builder().role("model").parts(accumulatedFunctionCalls).build())
+                .partial(false)
+                .build());
+      }
+
+      if (!finalResponses.isEmpty()) {
+        LlmResponse lastResponse = finalResponses.get(finalResponses.size() - 1);
+        finalResponses.set(
+            finalResponses.size() - 1, mergeMetadata(lastResponse, currentResponse, null));
+      }
+      return Flowable.fromIterable(finalResponses);
+    }
+
+    private static LlmResponse mergeMetadata(
+        LlmResponse lastResponse, LlmResponse currentResponse, Part currentPart) {
+      LlmResponse.Builder mergedBuilder =
+          lastResponse.toBuilder()
+              .usageMetadata(currentResponse.usageMetadata().orElse(null))
+              .finishReason(currentResponse.finishReason().orElse(null))
+              .modelVersion(currentResponse.modelVersion().orElse(null))
+              .errorCode(currentResponse.errorCode().orElse(null))
+              .groundingMetadata(currentResponse.groundingMetadata().orElse(null))
+              .inputTranscription(currentResponse.inputTranscription().orElse(null))
+              .outputTranscription(currentResponse.outputTranscription().orElse(null));
+
+      if (currentPart != null && currentPart.thoughtSignature().isPresent()) {
+        Content lastContent = lastResponse.content().orElse(null);
+        if (lastContent != null
+            && lastContent.parts().isPresent()
+            && !lastContent.parts().get().isEmpty()) {
+          Part lastPart = lastContent.parts().get().get(0);
+          Part mergedPart =
+              lastPart.toBuilder().thoughtSignature(currentPart.thoughtSignature().get()).build();
+          mergedBuilder.content(lastContent.toBuilder().parts(mergedPart).build());
+        }
+      }
+      return mergedBuilder.build();
+    }
   }
 
   private static LlmResponse responseFromText(String accumulatedText) {
@@ -369,7 +388,7 @@ public class Gemini extends BaseLlm {
    * Returns true if {@code response} should be emitted downstream by the streaming pipeline.
    *
    * <p>Drops chunks that carry neither semantic content (i.e. they are an empty-text-only response
-   * per {@link #isEmptyTextOnlyResponse}) nor any useful metadata (per {@link #hasUsefulMetadata}).
+   * per {@link #isEmptyTextOnlyResponse}) nor any useful metadata (per {@link #hasUsefulMetadata})
    *
    * <p>Package-private for testing.
    */

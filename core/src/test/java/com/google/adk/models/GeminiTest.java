@@ -33,15 +33,12 @@ import org.junit.runners.JUnit4;
 
 @RunWith(JUnit4.class)
 public final class GeminiTest {
-
   // Test cases for processRawResponses static method
   @Test
   public void processRawResponses_withTextChunks_emitsPartialResponses() {
     Flowable<GenerateContentResponse> rawResponses =
         Flowable.just(toResponseWithText("Hello"), toResponseWithText(" world"));
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses, isPartialTextResponse("Hello"), isPartialTextResponse(" world"));
   }
@@ -53,9 +50,7 @@ public final class GeminiTest {
         Flowable.just(
             toResponseWithText("Thinking..."),
             toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())));
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses,
         isPartialTextResponse("Thinking..."),
@@ -63,79 +58,25 @@ public final class GeminiTest {
         isFunctionCallResponse());
   }
 
-  // Regression test for b/513501918. gemini-3.1-flash-lite emits an extra trailing chunk after a
-  // function call: `{parts:[{text:""}], finishReason:STOP}`. That chunk must not be propagated as
-  // a non-partial event because BaseLlmFlow#run would treat it as the final response and
-  // terminate the loop before the function response is sent back to the model. The chunk's
-  // metadata (e.g. `finishReason`, `usageMetadata`) is preserved by emitting it on a content-less
-  // partial response instead of dropping the chunk entirely.
   @Test
-  public void
-      processRawResponses_functionCallThenEmptyTextWithStop_emitsFunctionCallAndMetadataOnlyPartial() {
-    Flowable<GenerateContentResponse> rawResponses =
-        Flowable.just(
-            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
-            toResponseWithText("", FinishReason.Known.STOP));
-
+  public void processRawResponses_streamingFunctionCallsAndStop_emitsPartialsThenFinalAggregated() {
+    Part fc1 = Part.fromFunctionCall("tool1", ImmutableMap.of("arg1", "val1"));
+    Part fc2 = Part.fromFunctionCall("tool2", ImmutableMap.of("arg2", "val2"));
+    GenerateContentResponse fc2WithStop =
+        GenerateContentResponse.builder()
+            .candidates(
+                Candidate.builder()
+                    .content(Content.builder().parts(fc2).build())
+                    .finishReason(new FinishReason(FinishReason.Known.STOP))
+                    .build())
+            .build();
+    Flowable<GenerateContentResponse> rawResponses = Flowable.just(toResponse(fc1), fc2WithStop);
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses,
-        isFunctionCallResponse(),
-        isContentlessPartialWithFinishReason(FinishReason.Known.STOP));
-  }
-
-  // Same as above but with `usageMetadata` on the trailing empty chunk: the metadata must survive
-  // on the emitted content-less partial.
-  @Test
-  public void
-      processRawResponses_functionCallThenEmptyTextWithUsageMetadata_preservesUsageMetadata() {
-    GenerateContentResponseUsageMetadata metadata = createUsageMetadata(5, 10, 15);
-    Flowable<GenerateContentResponse> rawResponses =
-        Flowable.just(
-            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
-            toResponseWithText("", FinishReason.Known.STOP, metadata));
-
-    Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
-    assertLlmResponses(
-        llmResponses, isFunctionCallResponse(), isContentlessPartialWithUsageMetadata(metadata));
-  }
-
-  // Same as above but without a finishReason or usageMetadata: the trailing empty chunk carries no
-  // useful payload and must be suppressed entirely.
-  @Test
-  public void processRawResponses_functionCallThenEmptyText_doesNotEmitExtraEmptyResponse() {
-    Flowable<GenerateContentResponse> rawResponses =
-        Flowable.just(
-            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
-            toResponseWithText(""));
-
-    Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
-    assertLlmResponses(llmResponses, isFunctionCallResponse());
-  }
-
-  // Combined scenario: leading partial text, then a function call, then the trailing empty-text
-  // chunk with STOP. Accumulated text must still be flushed, the function call must still be
-  // emitted, and the trailing chunk must surface only its metadata on a content-less partial.
-  @Test
-  public void
-      processRawResponses_textThenFunctionCallThenEmptyTextWithStop_emitsTextFunctionCallAndMetadata() {
-    Flowable<GenerateContentResponse> rawResponses =
-        Flowable.just(
-            toResponseWithText("Thinking..."),
-            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
-            toResponseWithText("", FinishReason.Known.STOP));
-
-    Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
-    assertLlmResponses(
-        llmResponses,
-        isPartialTextResponse("Thinking..."),
-        isFinalTextResponse("Thinking..."),
-        isFunctionCallResponse(),
-        isContentlessPartialWithFinishReason(FinishReason.Known.STOP));
+        isPartialFunctionCallResponse("tool1"),
+        isPartialFunctionCallResponse("tool2"),
+        isFinalAggregatedFunctionCallResponse("tool1", "tool2"));
   }
 
   @Test
@@ -143,9 +84,7 @@ public final class GeminiTest {
     Flowable<GenerateContentResponse> rawResponses =
         Flowable.just(
             toResponseWithText("Hello"), toResponseWithText(" world", FinishReason.Known.STOP));
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses,
         isPartialTextResponse("Hello"),
@@ -156,9 +95,7 @@ public final class GeminiTest {
   @Test
   public void processRawResponses_emptyStream_emitsNothing() {
     Flowable<GenerateContentResponse> rawResponses = Flowable.empty();
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(llmResponses);
   }
 
@@ -166,9 +103,7 @@ public final class GeminiTest {
   public void processRawResponses_singleEmptyResponse_emitsOneEmptyResponse() {
     Flowable<GenerateContentResponse> rawResponses =
         Flowable.just(GenerateContentResponse.builder().build());
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(llmResponses, isEmptyResponse());
   }
 
@@ -178,25 +113,18 @@ public final class GeminiTest {
         Flowable.just(
             toResponseWithText("Hello"),
             toResponseWithText(" world", FinishReason.Known.MAX_TOKENS));
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses, isPartialTextResponse("Hello"), isPartialTextResponse(" world"));
   }
 
   @Test
-  public void processRawResponses_textThenEmpty_emitsPartialTextThenFullTextAndEmpty() {
+  public void processRawResponses_textThenEmpty_emitsPartialTextThenFullText() {
     Flowable<GenerateContentResponse> rawResponses =
         Flowable.just(toResponseWithText("Thinking..."), GenerateContentResponse.builder().build());
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
-        llmResponses,
-        isPartialTextResponse("Thinking..."),
-        isFinalTextResponse("Thinking..."),
-        isEmptyResponse());
+        llmResponses, isPartialTextResponse("Thinking..."), isFinalTextResponse("Thinking..."));
   }
 
   @Test
@@ -206,9 +134,7 @@ public final class GeminiTest {
     Flowable<GenerateContentResponse> rawResponses =
         Flowable.just(
             toResponseWithText("Hello", metadata1), toResponseWithText(" world", metadata2));
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses,
         isPartialTextResponseWithUsageMetadata("Hello", metadata1),
@@ -222,14 +148,31 @@ public final class GeminiTest {
         Flowable.just(
             toResponseWithText("Hello"),
             toResponseWithText(" world", FinishReason.Known.STOP, metadata));
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses,
         isPartialTextResponse("Hello"),
         isPartialTextResponseWithUsageMetadata(" world", metadata),
         isFinalTextResponseWithUsageMetadata("Hello world", metadata));
+  }
+
+  @Test
+  public void
+      processRawResponses_textThenEmptyStopWithUsageMetadata_finalResponseIncludesUsageMetadata() {
+    GenerateContentResponseUsageMetadata metadata = createUsageMetadata(10, 20, 30);
+    GenerateContentResponse stopResponse =
+        GenerateContentResponse.builder()
+            .candidates(
+                Candidate.builder().finishReason(new FinishReason(FinishReason.Known.STOP)).build())
+            .usageMetadata(metadata)
+            .build();
+    Flowable<GenerateContentResponse> rawResponses =
+        Flowable.just(toResponseWithText("Hello"), stopResponse);
+    Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
+    assertLlmResponses(
+        llmResponses,
+        isPartialTextResponse("Hello"),
+        isFinalTextResponseWithUsageMetadata("Hello", metadata));
   }
 
   @Test
@@ -240,9 +183,7 @@ public final class GeminiTest {
         Flowable.just(
             toResponseWithThoughtText("Thinking", metadata1),
             toResponseWithThoughtText(" deeply", FinishReason.Known.STOP, metadata2));
-
     Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
     assertLlmResponses(
         llmResponses,
         isPartialThoughtResponseWithUsageMetadata("Thinking", metadata1),
@@ -250,9 +191,118 @@ public final class GeminiTest {
         isFinalThoughtResponseWithUsageMetadata("Thinking deeply", metadata2));
   }
 
+  @Test
+  public void processRawResponses_thoughtAndTextWithStop_onlyFinalTextIncludesUsageMetadata() {
+    GenerateContentResponseUsageMetadata metadata1 = createUsageMetadata(5, 5, 10);
+    GenerateContentResponseUsageMetadata metadata2 = createUsageMetadata(10, 20, 30);
+    Flowable<GenerateContentResponse> rawResponses =
+        Flowable.just(
+            toResponseWithThoughtText("Thinking", metadata1),
+            toResponseWithText("Answer", FinishReason.Known.STOP, metadata2));
+    Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
+    assertLlmResponses(
+        llmResponses,
+        isPartialThoughtResponseWithUsageMetadata("Thinking", metadata1),
+        isPartialTextResponseWithUsageMetadata("Answer", metadata2),
+        isFinalThoughtResponseWithNoUsageMetadata("Thinking"),
+        isFinalTextResponseWithUsageMetadata("Answer", metadata2));
+  }
+
+  @Test
+  public void
+      processRawResponses_textAndFunctionCallWithStop_onlyFinalFunctionCallIncludesUsageMetadata() {
+    GenerateContentResponseUsageMetadata metadata1 = createUsageMetadata(5, 5, 10);
+    GenerateContentResponseUsageMetadata metadata2 = createUsageMetadata(10, 20, 30);
+    Part fcPart = Part.fromFunctionCall("my_tool", ImmutableMap.of());
+    GenerateContentResponse stopResponse =
+        GenerateContentResponse.builder()
+            .candidates(
+                Candidate.builder()
+                    .content(Content.builder().parts(fcPart).build())
+                    .finishReason(new FinishReason(FinishReason.Known.STOP))
+                    .build())
+            .usageMetadata(metadata2)
+            .build();
+    Flowable<GenerateContentResponse> rawResponses =
+        Flowable.just(toResponseWithText("Answer", metadata1), stopResponse);
+    Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
+    assertLlmResponses(
+        llmResponses,
+        isPartialTextResponseWithUsageMetadata("Answer", metadata1),
+        isFinalTextResponseWithNoUsageMetadata("Answer"),
+        isPartialFunctionCallResponse("my_tool"),
+        isFinalAggregatedFunctionCallResponseWithUsageMetadata(metadata2, "my_tool"));
+  }
+
+  @Test
+  public void functionCallThenEmptyTextWithStop_emitsPartialThenFinalAggregatedFunctionCall() {
+    Flowable<GenerateContentResponse> rawResponses =
+        Flowable.just(
+            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
+            toResponseWithText("", FinishReason.Known.STOP));
+
+    Flowable<LlmResponse> llmResponses =
+        Gemini.processRawResponses(rawResponses).filter(Gemini::shouldEmit);
+
+    assertLlmResponses(
+        llmResponses,
+        isPartialFunctionCallResponse("test_function"),
+        isFinalAggregatedFunctionCallResponse("test_function"));
+  }
+
+  @Test
+  public void functionCallThenEmptyTextWithUsageMetadata_emitsFinalAggregatedWithUsageMetadata() {
+    GenerateContentResponseUsageMetadata metadata = createUsageMetadata(5, 10, 15);
+    Flowable<GenerateContentResponse> rawResponses =
+        Flowable.just(
+            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
+            toResponseWithText("", FinishReason.Known.STOP, metadata));
+
+    Flowable<LlmResponse> llmResponses =
+        Gemini.processRawResponses(rawResponses).filter(Gemini::shouldEmit);
+
+    assertLlmResponses(
+        llmResponses,
+        isPartialFunctionCallResponse("test_function"),
+        isFinalAggregatedFunctionCallResponseWithUsageMetadata(metadata, "test_function"));
+  }
+
+  @Test
+  public void functionCallThenEmptyText_doesNotEmitExtraEmptyResponse() {
+    Flowable<GenerateContentResponse> rawResponses =
+        Flowable.just(
+            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
+            toResponseWithText(""));
+
+    Flowable<LlmResponse> llmResponses =
+        Gemini.processRawResponses(rawResponses).filter(Gemini::shouldEmit);
+
+    assertLlmResponses(llmResponses, isPartialFunctionCallResponse("test_function"));
+  }
+
+  @Test
+  public void textThenFunctionCallThenEmptyTextWithStop_emitsTextThenFunctionCalls() {
+    Flowable<GenerateContentResponse> rawResponses =
+        Flowable.just(
+            toResponseWithText("Thinking..."),
+            toResponse(Part.fromFunctionCall("test_function", ImmutableMap.of())),
+            toResponseWithText("", FinishReason.Known.STOP));
+
+    Flowable<LlmResponse> llmResponses =
+        Gemini.processRawResponses(rawResponses).filter(Gemini::shouldEmit);
+
+    assertLlmResponses(
+        llmResponses,
+        isPartialTextResponse("Thinking..."),
+        isFinalTextResponse("Thinking..."),
+        isPartialFunctionCallResponse("test_function"),
+        isFinalAggregatedFunctionCallResponse("test_function"));
+  }
+
   // Test cases for the shouldEmit filter applied by generateContent after processRawResponses.
-  // shouldEmit drops chunks that are empty-text-only AND carry no useful metadata; everything else
-  // is forwarded. processRawResponses normally already strips empty-text-only chunks, so shouldEmit
+  // shouldEmit drops chunks that are empty-text-only unless they carry final metadata (usage
+  // metadata or finish reason); everything else is forwarded.
+  // processRawResponses normally already strips empty-text-only chunks, so shouldEmit
   // is defense-in-depth, but it must still behave correctly when fed any LlmResponse directly.
 
   @Test
@@ -314,8 +364,7 @@ public final class GeminiTest {
   @Test
   public void shouldEmit_contentlessResponse_returnsTrue() {
     // A response with no content at all is not an empty-text-only response, so it should pass
-    // through regardless of metadata. This is the shape emitted by processRawResponses after it
-    // strips empty-text content while preserving metadata.
+    // through.
     LlmResponse response = LlmResponse.builder().build();
 
     assertThat(Gemini.shouldEmit(response)).isTrue();
@@ -337,27 +386,7 @@ public final class GeminiTest {
     assertThat(Gemini.shouldEmit(response)).isTrue();
   }
 
-  @Test
-  public void processRawResponses_thoughtAndTextWithStop_onlyFinalTextIncludesUsageMetadata() {
-    GenerateContentResponseUsageMetadata metadata1 = createUsageMetadata(5, 5, 10);
-    GenerateContentResponseUsageMetadata metadata2 = createUsageMetadata(10, 20, 30);
-    Flowable<GenerateContentResponse> rawResponses =
-        Flowable.just(
-            toResponseWithThoughtText("Thinking", metadata1),
-            toResponseWithText("Answer", FinishReason.Known.STOP, metadata2));
-
-    Flowable<LlmResponse> llmResponses = Gemini.processRawResponses(rawResponses);
-
-    assertLlmResponses(
-        llmResponses,
-        isPartialThoughtResponseWithUsageMetadata("Thinking", metadata1),
-        isPartialTextResponseWithUsageMetadata("Answer", metadata2),
-        isFinalThoughtResponseWithNoUsageMetadata("Thinking"),
-        isFinalTextResponseWithUsageMetadata("Answer", metadata2));
-  }
-
   // Helper methods for assertions
-
   private void assertLlmResponses(
       Flowable<LlmResponse> llmResponses, Predicate<LlmResponse>... predicates) {
     TestSubscriber<LlmResponse> testSubscriber = llmResponses.test();
@@ -394,22 +423,50 @@ public final class GeminiTest {
     };
   }
 
-  private static Predicate<LlmResponse> isContentlessPartialWithFinishReason(
-      FinishReason.Known expectedFinishReason) {
+  private static Predicate<LlmResponse> isPartialFunctionCallResponse(String expectedToolName) {
     return response -> {
       assertThat(response.partial()).hasValue(true);
-      assertThat(response.content()).isEmpty();
-      assertThat(response.finishReason().map(fr -> fr.knownEnum())).hasValue(expectedFinishReason);
+      assertThat(response.content().get().parts().get()).hasSize(1);
+      assertThat(response.content().get().parts().get().get(0).functionCall().get().name())
+          .hasValue(expectedToolName);
       return true;
     };
   }
 
-  private static Predicate<LlmResponse> isContentlessPartialWithUsageMetadata(
-      GenerateContentResponseUsageMetadata expectedMetadata) {
+  private static Predicate<LlmResponse> isFinalAggregatedFunctionCallResponse(
+      String... expectedToolNames) {
     return response -> {
-      assertThat(response.partial()).hasValue(true);
-      assertThat(response.content()).isEmpty();
+      assertThat(response.partial()).hasValue(false);
+      assertThat(response.content().get().parts().get()).hasSize(expectedToolNames.length);
+      for (int i = 0; i < expectedToolNames.length; i++) {
+        assertThat(response.content().get().parts().get().get(i).functionCall().get().name())
+            .hasValue(expectedToolNames[i]);
+      }
+      return true;
+    };
+  }
+
+  private static Predicate<LlmResponse> isFinalAggregatedFunctionCallResponseWithUsageMetadata(
+      GenerateContentResponseUsageMetadata expectedMetadata, String... expectedToolNames) {
+    return response -> {
+      assertThat(response.partial()).hasValue(false);
+      assertThat(response.content().get().parts().get()).hasSize(expectedToolNames.length);
+      for (int i = 0; i < expectedToolNames.length; i++) {
+        assertThat(response.content().get().parts().get().get(i).functionCall().get().name())
+            .hasValue(expectedToolNames[i]);
+      }
       assertThat(response.usageMetadata()).hasValue(expectedMetadata);
+      return true;
+    };
+  }
+
+  private static Predicate<LlmResponse> isFinalTextResponseWithNoUsageMetadata(
+      String expectedText) {
+    return response -> {
+      assertThat(response.partial()).isEmpty();
+      assertThat(GeminiUtil.getPart0FromLlmResponse(response).flatMap(Part::text).orElse(""))
+          .isEqualTo(expectedText);
+      assertThat(response.usageMetadata()).isEmpty();
       return true;
     };
   }
@@ -485,7 +542,6 @@ public final class GeminiTest {
   }
 
   // Helper methods to create responses for testing
-
   private GenerateContentResponse toResponseWithText(String text) {
     return toResponse(Part.fromText(text));
   }
@@ -496,14 +552,6 @@ public final class GeminiTest {
             .content(Content.builder().parts(Part.fromText(text)).build())
             .finishReason(new FinishReason(finishReason))
             .build());
-  }
-
-  private GenerateContentResponse toResponse(Part part) {
-    return toResponse(Candidate.builder().content(Content.builder().parts(part).build()).build());
-  }
-
-  private GenerateContentResponse toResponse(Candidate candidate) {
-    return GenerateContentResponse.builder().candidates(candidate).build();
   }
 
   private GenerateContentResponse toResponseWithText(
@@ -529,6 +577,14 @@ public final class GeminiTest {
                 .build())
         .usageMetadata(usageMetadata)
         .build();
+  }
+
+  private GenerateContentResponse toResponse(Part part) {
+    return toResponse(Candidate.builder().content(Content.builder().parts(part).build()).build());
+  }
+
+  private GenerateContentResponse toResponse(Candidate candidate) {
+    return GenerateContentResponse.builder().candidates(candidate).build();
   }
 
   private GenerateContentResponse toResponseWithThoughtText(
